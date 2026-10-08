@@ -54,8 +54,16 @@ jobs:
                   json.load(f)
               print('ok ', p)
           PY
-          node --check htdocs/luci-static/resources/view/ismart/ismart.js \
-            && echo 'ok  ismart.js'
+
+          # LuCI 视图顶部的 'require view' / 'require uci' 是 LuCI 预处理器指令，
+          # 不是合法 JS——直接 node --check 必然报 "Unexpected identifier"。
+          # 先把这些指令行剥掉再检查，剩下的才是真正的 JS 语法。
+          # 这样能抓到括号/字符串不配平这类必然导致页面白屏的问题。
+          sed -e "s/^\s*'require [^']*'\s*;\?\s*$//" \
+              -e "s/^require [^;]*;\s*$//" \
+              htdocs/luci-static/resources/view/ismart/ismart.js > /tmp/ismart-stripped.js
+          node --check /tmp/ismart-stripped.js
+          echo 'ok  ismart.js（已剥离 LuCI require 指令）'
 
   build:
     name: ${{ matrix.version }} ${{ matrix.arch }}
