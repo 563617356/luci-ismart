@@ -587,6 +587,13 @@ jobs:
     if: always() && (startsWith(github.ref, 'refs/tags/v') || inputs.release)
     runs-on: ubuntu-latest
     steps:
+      # gh CLI 依赖 git 才能确定仓库与远端，即使已设 GITHUB_REPOSITORY、
+      # GITHUB_TOKEN 也不行。没有 checkout 时它会报
+      #   failed to run git: fatal: not a git repository
+      # 并以非零退出，整个 step 挂掉。
+      # 这里 checkout 只是给 gh 用（后续不读源码），很cheap。
+      - uses: actions/checkout@v4
+
       # 只下载 rel-* 前缀的 artifact。验证产物（verify-*）用于确认
       # aarch64 也能构建，不该出现在给用户下载的 Release 里。
       - uses: actions/download-artifact@v4
