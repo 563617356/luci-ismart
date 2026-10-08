@@ -595,30 +595,29 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: 归集产物到单一目录
+      # 归集与发布放在同一个 step：文件路径由 shell find 出来，
+      # 直接展开成多行传给 gh CLI，绕开 action-gh-release 的 glob 解析差异。
+      - name: 归集产物并创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          # download-artifact + merge-multiple 的目录行为并不直觉：
-          # 文件名不冲突时会保留各自的 artifact 子目录
-          #（artifacts/rel-24.10.8-x86-64/...），冲突时才摊平到根目录。
-          # 所以不能假设文件就在 artifacts/ 根下，也不能用
-          # `rm -f artifacts/rel-*` 去「清理」——那会把子目录连同产物一起删掉，
-          # 表现是后面 gh-release 报 "Pattern does not match any files"。
-          #
-          # 稳妥做法：递归把所有包文件搬到 release/ 目录，其余一律不管。
-          rm -rf release
-          mkdir -p release
-          find artifacts -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp {} release/ \;
-          echo "--- 原始结构 ---"
-          find artifacts -maxdepth 2 | head -n 20
-          echo "--- 归集后 ---"
-          ls -la release/
 
-      - name: 无产物则中止发布
-        run: |
-          set -eu
-          N=$(find release -type f \( -name '*.ipk' -o -name '*.apk' \) | wc -l)
-          echo "发布产物数: $N"
+          # ---- 归集 ----
+          # download-artifact + merge-multiple 的目录行为并不直觉：
+          # 文件名冲突时摊平到根目录，不冲突时保留各自的 artifact 子目录。
+          # 所以既不能假设文件在 artifacts/ 根下，也不能用
+          # `rm -f artifacts/rel-*` 去「清理」——那会把子目录连同产物删光。
+          #
+          # 递归收集全部包文件，不依赖目录结构。
+          echo "--- 原始结构 ---"
+          find artifacts -maxdepth 2 | sort | head -n 20
+
+          mapfile -t FILES < <(find artifacts -type f \( -name '*.ipk' -o -name '*.apk' \) | sort)
+          N=${#FILES[@]}
+          echo "--- 产物清单（$N 个）---"
+          printf '%s\n' "${FILES[@]}"
+
           if [ "$N" -eq 0 ]; then
             echo "::error::没有任何产物，跳过发布"
             exit 1
@@ -627,13 +626,26 @@ jobs:
           # 给出警告但不阻断（部分版本可用仍有价值）。
           if [ "$N" -lt 4 ]; then
             echo "::warning::产物仅 $N 个，预期 8 个（4 版本 × 2 包）"
-            echo "::warning::可能有版本构建失败或文件名冲突导致覆盖"
           fi
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          # 只传归集目录下的包文件。上一步已把包全搬进 release/，
-          # 这里再限定一层，避免将来目录结构变化时混入别的东西。
-          files: release/*.ipk release/*.apk
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+          # ---- 发布 ----
+          # 不用 softprops/action-gh-release：它的 files 走 @actions/glob，
+          # 对「目录 + 通配符」的匹配与 shell 不一致——实测 release/*.ipk
+          # 明明有 8 个文件却报 "does not match any files"。
+          # gh release create 收显式路径列表，行为可预测。
+          #
+          # tag 重跑时 Release 已存在，gh release create 会直接报错
+          # （它没有 --clobber 参数），所以先删 Release 再建。
+          # 只删 Release 不删 tag —— tag 是本次 workflow 的触发源，
+          # 删掉会让 run 与 tag 状态对不上。
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} 已存在，先删除再重建"
+            gh release delete "${GITHUB_REF_NAME}" --yes
+          fi
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            "${FILES[@]}"
+          echo "Release 已创建: ${GITHUB_REF_NAME}"
