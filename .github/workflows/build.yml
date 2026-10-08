@@ -399,8 +399,24 @@ jobs:
           # make 对不存在的依赖只报 WARNING、不中断构建，于是「依赖写错」
           # 会一路绿灯到发布，用户装上才发现缺东西。这里当错误处理。
           #
-          # 排除 luci-base：它在 feeds install 之前的索引扫描阶段必然报一次
-          # 不存在，属时序噪音，后续 feeds install 会正确装上。
+          # 判据不能是「警告里出现过这个名字」——busybox、luci-base 这类
+          # 在索引扫描早期都会报一次不存在（它们分别来自 SDK 内置与
+          # feeds install），属时序噪音，据此判错会误伤。
+          #
+          # 正确判据是**这个依赖最终有没有被解析进 .config**：
+          # 有效依赖会展开成 CONFIG_PACKAGE_<名字>=y 或 =m，
+          # 无效依赖则完全不出现在 .config 里。
+          #
+          # .config 缺失时不能判失败——那说明前面的步骤就没跑成功，
+          # 报「依赖无效」会把人带偏。
+          if [ ! -f openwrt/.config ]; then
+            echo "::warning::openwrt/.config 不存在，跳过依赖检查"
+            exit 0
+          fi
+          echo "--- .config 中与本包相关的条目 ---"
+          grep -E '^CONFIG_PACKAGE_(ismart|luci-app-ismart|busybox|luci-base|awk|ip-tiny|ip-full)=' \
+               openwrt/.config || echo "  (无)"
+
           rm -f /tmp/bad-deps.txt
           for LOG in /tmp/build-ui.log /tmp/build-core.log; do
             [ -f "$LOG" ] || continue
@@ -408,16 +424,22 @@ jobs:
               | sed "s/.*dependency on '//; s/'\$//" | sort -u > /tmp/deps-raw.txt
             while read -r dep; do
               [ -n "$dep" ] || continue
-              [ "$dep" = "luci-base" ] && continue
-              echo "::error::Makefile 声明了不存在的依赖：$dep"
-              echo "$dep" >> /tmp/bad-deps.txt
+              dep="$(printf '%s' "$dep" | tr 'A-Z' 'a-z' | tr '_' '-')"
+              if grep -qE "^CONFIG_PACKAGE_${dep}=" openwrt/.config 2>/dev/null; then
+                echo "  依赖有效: $dep -> $(grep -E "^CONFIG_PACKAGE_${dep}=" openwrt/.config)"
+              else
+                echo "::error::Makefile 声明了无效依赖 '$dep'，它没有出现在 .config 中"
+                echo "$dep" >> /tmp/bad-deps.txt
+              fi
             done < /tmp/deps-raw.txt
           done
           if [ -s /tmp/bad-deps.txt ]; then
             echo "::error::无效依赖：$(sort -u /tmp/bad-deps.txt | tr '\n' ' ')"
+            echo "::error::提示：awk/sed/grep 等是 busybox 的 applet，没有独立包；"
+            echo "::error::      应写 +busybox 而不是 +awk"
             exit 1
           fi
-          echo "依赖检查通过（本包声明的依赖均存在）"
+          echo "依赖检查通过（本包声明的依赖均已解析进 .config）"
 
       - name: 收集产物
         if: always()
