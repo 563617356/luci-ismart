@@ -18,7 +18,18 @@ define Package/ismart-core
   CATEGORY:=Utilities
   SUBMENU:=3. Applications
   TITLE:=旁路由模式切换（运行时）
-  DEPENDS:=+ip-tiny +awk
+  # 只依赖 busybox：awk / sed / grep / cut / tr / date / ping 都由它提供。
+  #
+  # 不要写 +awk —— OpenWrt 没有独立的 awk 包，awk 是 busybox 的 applet。
+  # 也不要写 +ip-tiny —— 那不是有效包名（有效的是 ip-full / ip-tiny 只在
+  # 某些 feeds 里出现）。写了会得到：
+  #   WARNING: Makefile 'package/ismart-core/Makefile' has a dependency
+  #            on 'ip-tiny', which does not exist
+  # 该警告不阻断构建，但依赖实际上没被声明，等于没写。
+  #
+  # `ip` 命令本插件只作可选降级路径（ubus 不可用时才用），
+  # 缺失时核心功能不受影响，故不强制依赖。
+  DEPENDS:=+busybox
   PKGARCH:=all
 endef
 

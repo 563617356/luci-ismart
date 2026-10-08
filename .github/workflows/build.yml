@@ -66,7 +66,7 @@ jobs:
           echo 'ok  ismart.js（已剥离 LuCI require 指令）'
 
   build:
-    name: ${{ matrix.version }} ${{ matrix.arch }}
+    name: ${{ matrix.version }} ${{ matrix.label }}
     needs: test
     runs-on: ubuntu-latest
     strategy:
@@ -76,26 +76,75 @@ jobs:
           # SDK 文件名由下载步骤从目录索引动态发现（文件名含 gcc 版本号，
           # 且 24.10+ 用 .tar.zst、23.05- 用 .tar.xz，硬编码必然失效）。
           #
-          # arch 必须用各版本真实存在的名字。已逐一核对目录确认：
-          #   x86-64              所有版本
-          #   armsr-armv8         23.05 起（22.03 无此 subtarget）
-          #   armvirt-64          仅 22.03（23.05 起改名）
-          #   qualcommax-ipq807x  24.10/25.12（23.05 无 qualcommax 目录）
+          # arch / sdk_subtarget 均已对 downloads.openwrt.org 的目录索引
+          # 逐个核实存在（用两级索引：targets/ 下是顶层 vendor 目录，
+          # vendor 下才是 subtarget）：
           #
-          # 本项目两个包都是 PKGARCH:=all，架构无关，
-          # 因此这里只验证 SDK 能否正常解包与识别包，不必铺满全架构。
+          #   x86-64              所有版本
+          #   armsr-armv8         23.05 起（22.03 的 targets/ 下无 armsr 目录）
+          #   qualcommax-ipq807x  24.10/25.12（22.03/23.05 无 qualcommax 目录）
+          #   rockchip-armv8      所有版本，22.03 的 aarch64 路线靠它
+          #   mediatek-filogic    23.05 起（22.03 的 mediatek 下只有 mt762x，属 armv7）
+          #
+          # 注意 armsr 下只有 armv7 / armv8，没有 armv8.2 —— 别按名字猜。
+          #
+          # 本项目两个包都是 PKGARCH:=all，架构无关，一份包通吃所有架构。
+          # 这里的 aarch64 矩阵不是为了产出 arm64 专用包，而是**验证**：
+          # 万一将来误加了 x86 专属依赖，只有真机架构的 SDK 才能发现。
+          # 所以 aarch64 目标的产物不进 Release，只做构建校验。
           - version: '25.12.5'
             arch: x86-64
             sdk_subtarget: x86/64
+            label: x86-64
+            release: true
+          - version: '25.12.5'
+            arch: armsr-armv8
+            sdk_subtarget: armsr/armv8
+            label: aarch64 (armsr-armv8)
+            release: false
+          - version: '25.12.5'
+            arch: qualcommax-ipq807x
+            sdk_subtarget: qualcommax/ipq807x
+            label: aarch64 (qualcommax-ipq807x)
+            release: false
+
           - version: '24.10.8'
             arch: x86-64
             sdk_subtarget: x86/64
+            label: x86-64
+            release: true
+          - version: '24.10.8'
+            arch: armsr-armv8
+            sdk_subtarget: armsr/armv8
+            label: aarch64 (armsr-armv8)
+            release: false
+          - version: '24.10.8'
+            arch: qualcommax-ipq807x
+            sdk_subtarget: qualcommax/ipq807x
+            label: aarch64 (qualcommax-ipq807x)
+            release: false
+
           - version: '23.05.6'
             arch: x86-64
             sdk_subtarget: x86/64
+            label: x86-64
+            release: true
+          - version: '23.05.6'
+            arch: armsr-armv8
+            sdk_subtarget: armsr/armv8
+            label: aarch64 (armsr-armv8)
+            release: false
+
           - version: '22.03.7'
             arch: x86-64
             sdk_subtarget: x86/64
+            label: x86-64
+            release: true
+          - version: '22.03.7'
+            arch: rockchip-armv8
+            sdk_subtarget: rockchip/armv8
+            label: aarch64 (rockchip-armv8)
+            release: false
 
     steps:
       - uses: actions/checkout@v4
@@ -333,13 +382,47 @@ jobs:
 
       - name: 编译
         run: |
-          set -eu
+          set -o pipefail
           cd openwrt
-          make package/luci-app-ismart/compile V=s -j"$(nproc)"
-          make package/ismart-core/compile    V=s -j"$(nproc)"
+          # 编译输出留档：后面的依赖检查要从里面 grep，
+          # 而依赖无效时 make 只报 WARNING 不中断，不能靠退出码判断。
+          #
+          # pipefail 是必须的：`cmd | tee log` 的退出码默认取 tee 的，
+          # 编译失败会被吞掉、CI 照样绿灯。这里显式打开。
+          make package/luci-app-ismart/compile V=s -j"$(nproc)" 2>&1 | tee /tmp/build-ui.log
+          make package/ismart-core/compile    V=s -j"$(nproc)" 2>&1 | tee /tmp/build-core.log
+
+      - name: 检查本包是否有无效依赖
+        if: always()
+        run: |
+          set -u
+          # make 对不存在的依赖只报 WARNING、不中断构建，于是「依赖写错」
+          # 会一路绿灯到发布，用户装上才发现缺东西。这里当错误处理。
+          #
+          # 排除 luci-base：它在 feeds install 之前的索引扫描阶段必然报一次
+          # 不存在，属时序噪音，后续 feeds install 会正确装上。
+          rm -f /tmp/bad-deps.txt
+          for LOG in /tmp/build-ui.log /tmp/build-core.log; do
+            [ -f "$LOG" ] || continue
+            grep -oE "ismart[a-z-]*/Makefile' has a dependency on '[^']+'" "$LOG" 2>/dev/null \
+              | sed "s/.*dependency on '//; s/'\$//" | sort -u > /tmp/deps-raw.txt
+            while read -r dep; do
+              [ -n "$dep" ] || continue
+              [ "$dep" = "luci-base" ] && continue
+              echo "::error::Makefile 声明了不存在的依赖：$dep"
+              echo "$dep" >> /tmp/bad-deps.txt
+            done < /tmp/deps-raw.txt
+          done
+          if [ -s /tmp/bad-deps.txt ]; then
+            echo "::error::无效依赖：$(sort -u /tmp/bad-deps.txt | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "依赖检查通过（本包声明的依赖均存在）"
 
       - name: 收集产物
         if: always()
+        env:
+          IS_RELEASE: ${{ matrix.release }}
         run: |
           set -u
           OUT="$GITHUB_WORKSPACE/artifacts"
@@ -349,26 +432,61 @@ jobs:
           # apk 形如 ismart-core-1.0.0-r1.apk（无下划线分版本），
           # 所以两个模式都要匹配，否则 apk 会被漏掉。
           #
-          # 关键：加版本与架构后缀。Release 用 merge-multiple 把各架构
-          # artifact 合并到同一目录，同名文件会互相覆盖。
+          # 包本身是 PKGARCH:=all，架构无关，所以**发布**产物只按 OpenWrt
+          # 版本命名。早期版本把 x86-64 拼进了文件名（..._24.10.8_x86-64.ipk），
+          # 会被误解成「只能装在 x86 上」，而实际上 aarch64 装的是同一个文件。
+          #
+          # aarch64 验证目标（IS_RELEASE=false）额外带上架构后缀，
+          # 单独放到 verify/ 子目录，不进 Release——它只是用来证明
+          # 「这份 all 包在 arm64 SDK 上也能构建通过」。
           VER="${{ matrix.version }}"
           ARCH_NAME=$(echo "${{ matrix.arch }}" | tr '/' '-')
+
           for f in $(find openwrt/bin -type f \
               \( -name 'luci-app-ismart*.ipk' -o -name 'luci-app-ismart*.apk' \
               -o -name 'ismart-core*.ipk'    -o -name 'ismart-core*.apk' \) 2>/dev/null); do
             base=$(basename "$f")
             ext="${base##*.}"
             stem="${base%.*}"
-            cp "$f" "$OUT/${stem}_${VER}_${ARCH_NAME}.${ext}"
-            echo "  $(basename "$f") -> ${stem}_${VER}_${ARCH_NAME}.${ext}"
+            if [ "$IS_RELEASE" = "true" ]; then
+              cp "$f" "$OUT/${stem}_${VER}.${ext}"
+              echo "  发布  $(basename "$f") -> ${stem}_${VER}.${ext}"
+            else
+              mkdir -p "$OUT/verify"
+              cp "$f" "$OUT/verify/${stem}_${VER}_${ARCH_NAME}.${ext}"
+              echo "  验证  $(basename "$f") -> verify/${stem}_${VER}_${ARCH_NAME}.${ext}"
+            fi
           done
 
           echo
           echo "=== 产物 ==="
           ls -la "$OUT" || echo "  无产物"
-          n=$(ls -1 "$OUT" 2>/dev/null | wc -l)
+          n=$(find "$OUT" -type f | wc -l)
           echo "共 $n 个"
           [ "$n" -ge 2 ] || echo "::warning::产物少于 2 个，可能有包未编译"
+
+      - name: 校验产物架构标记
+        if: always()
+        env:
+          IS_RELEASE: ${{ matrix.release }}
+        run: |
+          set -eu
+          # 包名里的架构段必须是 all。若变成 x86-64 之类，说明
+          # PKGARCH:=all 被改坏了——那会让 aarch64 设备无法安装。
+          n=$(find "$GITHUB_WORKSPACE/artifacts" -type f \( -name '*.ipk' -o -name '*.apk' \) | wc -l)
+          [ "$n" -gt 0 ] || { echo "::warning::无产物可校验"; exit 0; }
+
+          bad=0
+          for f in $(find "$GITHUB_WORKSPACE/artifacts" -type f -name '*.ipk'); do
+            b=$(basename "$f")
+            echo "$b" | grep -q '_all' || { echo "::error::$b 架构段不是 all"; bad=1; }
+          done
+          for f in $(find "$GITHUB_WORKSPACE/artifacts" -type f -name '*.apk'); do
+            b=$(basename "$f")
+            echo "$b" | grep -qE '_all(_|\.)' || { echo "::error::$b 架构段不是 all"; bad=1; }
+          done
+          [ "$bad" = "0" ] && echo "产物架构标记校验通过（全部为 all）"
+          exit "$bad"
 
       - name: 诊断
         if: always()
@@ -399,7 +517,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: luci-ismart-${{ matrix.version }}-${{ matrix.arch }}
+          # 发布产物与验证产物用不同前缀，Release 只取 rel-*
+          name: ${{ matrix.release && 'rel' || 'verify' }}-${{ matrix.version }}-${{ matrix.arch }}
           path: artifacts/*
           # 编译失败时不额外报错，诊断步骤的输出才是关键信息
           if-no-files-found: ignore
@@ -413,19 +532,27 @@ jobs:
     if: always() && (startsWith(github.ref, 'refs/tags/v') || inputs.release)
     runs-on: ubuntu-latest
     steps:
+      # 只下载 rel-* 前缀的 artifact。验证产物（verify-*）用于确认
+      # aarch64 也能构建，不该出现在给用户下载的 Release 里。
       - uses: actions/download-artifact@v4
         with:
+          pattern: rel-*
           path: artifacts
           merge-multiple: true
 
-      - name: 列出产物
-        run: ls -la artifacts/
+      - name: 清理并列出产物
+        run: |
+          set -eu
+          # verify 子目录若混进来会被 gh-release 当成附件上传
+          rm -rf artifacts/verify
+          rm -f artifacts/rel-*
+          ls -la artifacts/
 
       - name: 无产物则中止发布
         run: |
           set -eu
-          N=$(ls -1 artifacts/ 2>/dev/null | wc -l)
-          echo "合并后产物数: $N"
+          N=$(find artifacts -type f \( -name '*.ipk' -o -name '*.apk' \) | wc -l)
+          echo "发布产物数: $N"
           ls -la artifacts/
           if [ "$N" -eq 0 ]; then
             echo "::error::没有任何产物，跳过发布"
@@ -434,11 +561,14 @@ jobs:
           # 4 个版本 × 2 个包 = 8 个文件。全失败时会远少于这个数，
           # 给出警告但不阻断（部分版本可用仍有价值）。
           if [ "$N" -lt 4 ]; then
-            echo "::warning::产物仅 $N 个，预期约 8 个（4 版本 × 2 包）"
+            echo "::warning::产物仅 $N 个，预期 8 个（4 版本 × 2 包）"
             echo "::warning::可能有版本构建失败或文件名冲突导致覆盖"
           fi
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          # 明确只传包文件。上一步已删掉 verify/ 目录，
+          # 这里再限定一层，避免将来目录结构变化时把验证产物混进 Release。
+          files: artifacts/*.ipk artifacts/*.apk
+          fail_on_unmatched_files: true
           generate_release_notes: true
