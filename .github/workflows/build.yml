@@ -635,17 +635,23 @@ jobs:
           # gh release create 收显式路径列表，行为可预测。
           #
           # tag 重跑时 Release 已存在，gh release create 会直接报错
-          # （它没有 --clobber 参数），所以先删 Release 再建。
-          # 只删 Release 不删 tag —— tag 是本次 workflow 的触发源，
-          # 删掉会让 run 与 tag 状态对不上。
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+          # （它没有 --clobber 参数），所以先删再建。
+          # 只删 Release 不删 tag —— tag 是本次 workflow 的触发源。
+          #
+          # 判存在必须用 API 而不是 `gh release view`：
+          # 该子命令在 Release 不存在时会顺带查 git，
+          # 而本 job 没有 checkout，于是报 "not a git repository" 并非零退出。
+          # 放在 if 条件里虽然 stdout/stderr 被丢弃，
+          # 但 set -e 下整个脚本仍会中止。API 路径不碰 git。
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+               >/dev/null 2>&1; then
             echo "Release ${GITHUB_REF_NAME} 已存在，先删除再重建"
-            gh release delete "${GITHUB_REF_NAME}" --yes
+            gh api --method DELETE \
+               "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
           fi
 
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            --verify-tag \
             "${FILES[@]}"
           echo "Release 已创建: ${GITHUB_REF_NAME}"
