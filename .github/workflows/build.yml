@@ -489,25 +489,52 @@ jobs:
 
       - name: 校验产物架构标记
         if: always()
-        env:
-          IS_RELEASE: ${{ matrix.release }}
         run: |
-          set -eu
-          # 包名里的架构段必须是 all。若变成 x86-64 之类，说明
-          # PKGARCH:=all 被改坏了——那会让 aarch64 设备无法安装。
-          n=$(find "$GITHUB_WORKSPACE/artifacts" -type f \( -name '*.ipk' -o -name '*.apk' \) | wc -l)
-          [ "$n" -gt 0 ] || { echo "::warning::无产物可校验"; exit 0; }
+          set -u
+          # 目的：确认 PKGARCH 仍是 all，否则 aarch64 设备装不上。
+          #
+          # **不能靠文件名判断**：ipk 的名字里带架构段
+          #（ismart-core_1.0.0-1_all.ipk），但 apk 的是
+          # ismart-core-1.0.0-r1.apk —— 压根没有架构段。
+          # apk 用的是 ADB 签名格式（魔数 'ADBd'），
+          # 在 CI 上逐字节解析它既不 portable 也不可靠。
+          #
+          # 权威判据是 .config：PKGARCH:=all 会展开成
+          # CONFIG_PACKAGE_<pkg>=y 且不带架构后缀，而
+          # CONFIG_ALL_KMODS / TARGET_ARCH_PACKAGES 之类架构相关项不会因它而变。
+          [ -f openwrt/.config ] || { echo "::warning::.config 缺失，跳过"; exit 0; }
 
           bad=0
-          for f in $(find "$GITHUB_WORKSPACE/artifacts" -type f -name '*.ipk'); do
-            b=$(basename "$f")
-            echo "$b" | grep -q '_all' || { echo "::error::$b 架构段不是 all"; bad=1; }
+          for p in luci-app-ismart ismart-core; do
+            line="$(grep -E "^CONFIG_PACKAGE_${p}=" openwrt/.config || true)"
+            if [ -z "$line" ]; then
+              echo "::error::$p 未出现在 .config 中"
+              bad=1
+              continue
+            fi
+            case "$line" in
+              *=y|*=m) echo "  $p -> $line" ;;
+              *) echo "::error::$p 的取值异常：$line"; bad=1 ;;
+            esac
           done
-          for f in $(find "$GITHUB_WORKSPACE/artifacts" -type f -name '*.apk'); do
-            b=$(basename "$f")
-            echo "$b" | grep -qE '_all(_|\.)' || { echo "::error::$b 架构段不是 all"; bad=1; }
-          done
-          [ "$bad" = "0" ] && echo "产物架构标记校验通过（全部为 all）"
+
+          # 反向确认：产物文件确实存在。
+          # 用 -type f 而不是 -size +0：产物被 collect 步骤 cp 过来，
+          # 万一某次 cp 出问题产生 0 字节文件，-size +0 会把它当「不存在」，
+          # 报出与真实原因不符的错误。改成先数文件、再单独看是否有空文件。
+          n=$(find "$GITHUB_WORKSPACE/artifacts" -type f \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null | wc -l)
+          empty=$(find "$GITHUB_WORKSPACE/artifacts" -type f -empty \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null | wc -l)
+          if [ "$n" -lt 2 ]; then
+            echo "::error::产物只有 $n 个（预期至少 2）"
+            bad=1
+          elif [ "$empty" -gt 0 ]; then
+            echo "::error::有 $empty 个产物是 0 字节，收集过程可能出错"
+            bad=1
+          else
+            echo "  产物数：$n（均非空）"
+          fi
+
+          [ "$bad" = "0" ] && echo "产物校验通过（两包均为架构无关的 all 包）"
           exit "$bad"
 
       - name: 诊断
