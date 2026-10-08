@@ -568,7 +568,13 @@ jobs:
         with:
           # 发布产物与验证产物用不同前缀，Release 只取 rel-*
           name: ${{ matrix.release && 'rel' || 'verify' }}-${{ matrix.version }}-${{ matrix.arch }}
-          path: artifacts/*
+          # 用目录而不是 'artifacts/*'：
+          # verify 目标的产物在 artifacts/verify/ 子目录下（见收集步骤），
+          # 而 artifacts/* 这个 glob 只匹配文件、不匹配目录，
+          # 两种目标的 artifact 内部结构会不一致，
+          # 后面 merge-multiple 的行为也随之不同（同名摊平、
+          # 不同名保留子目录），很难排查。直接传整个目录最稳。
+          path: artifacts/
           # 编译失败时不额外报错，诊断步骤的输出才是关键信息
           if-no-files-found: ignore
 
@@ -589,20 +595,30 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: 清理并列出产物
+      - name: 归集产物到单一目录
         run: |
           set -eu
-          # verify 子目录若混进来会被 gh-release 当成附件上传
-          rm -rf artifacts/verify
-          rm -f artifacts/rel-*
-          ls -la artifacts/
+          # download-artifact + merge-multiple 的目录行为并不直觉：
+          # 文件名不冲突时会保留各自的 artifact 子目录
+          #（artifacts/rel-24.10.8-x86-64/...），冲突时才摊平到根目录。
+          # 所以不能假设文件就在 artifacts/ 根下，也不能用
+          # `rm -f artifacts/rel-*` 去「清理」——那会把子目录连同产物一起删掉，
+          # 表现是后面 gh-release 报 "Pattern does not match any files"。
+          #
+          # 稳妥做法：递归把所有包文件搬到 release/ 目录，其余一律不管。
+          rm -rf release
+          mkdir -p release
+          find artifacts -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp {} release/ \;
+          echo "--- 原始结构 ---"
+          find artifacts -maxdepth 2 | head -n 20
+          echo "--- 归集后 ---"
+          ls -la release/
 
       - name: 无产物则中止发布
         run: |
           set -eu
-          N=$(find artifacts -type f \( -name '*.ipk' -o -name '*.apk' \) | wc -l)
+          N=$(find release -type f \( -name '*.ipk' -o -name '*.apk' \) | wc -l)
           echo "发布产物数: $N"
-          ls -la artifacts/
           if [ "$N" -eq 0 ]; then
             echo "::error::没有任何产物，跳过发布"
             exit 1
@@ -616,8 +632,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          # 明确只传包文件。上一步已删掉 verify/ 目录，
-          # 这里再限定一层，避免将来目录结构变化时把验证产物混进 Release。
-          files: artifacts/*.ipk artifacts/*.apk
+          # 只传归集目录下的包文件。上一步已把包全搬进 release/，
+          # 这里再限定一层，避免将来目录结构变化时混入别的东西。
+          files: release/*.ipk release/*.apk
           fail_on_unmatched_files: true
           generate_release_notes: true
