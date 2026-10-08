@@ -1,0 +1,26 @@
+# OpenWrt 构建产物
+# 注意：目录名必须以 / 锚定到仓库根。
+# 未锚定的 "bin/" 会匹配任意层级，静默吞掉 root/usr/bin/ismart-ctl 这类源码。
+/bin/
+/build_dir/
+/staging_dir/
+/tmp/
+/dl/
+/logs/
+/artifacts/
+/openwrt/
+/sdk.tar
+
+# Python 测试残留
+__pycache__/
+*.pyc
+.uci-state.json
+.uci.sock
+
+# 编辑器与系统文件
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,87 @@
+/* luci-ismart 界面样式 */
+
+.ismart-table {
+	width: 100%;
+	margin: 0;
+}
+
+.ismart-table td {
+	padding: 6px 10px;
+	border-bottom: 1px solid rgba(128, 128, 128, 0.18);
+	vertical-align: top;
+}
+
+.ismart-td-key {
+	width: 190px;
+	font-weight: 600;
+	color: #6b7280;
+}
+
+.ismart-td-val {
+	word-break: break-all;
+}
+
+.ismart-badge-row {
+	margin: 4px 0 12px 0;
+}
+
+.ismart-badge {
+	display: inline-block;
+	padding: 5px 16px;
+	border-radius: 14px;
+	font-size: 14px;
+	font-weight: 600;
+	line-height: 1.4;
+	letter-spacing: 0.5px;
+}
+
+.ismart-badge-bypass {
+	background: #e0f2fe;
+	color: #075985;
+}
+
+.ismart-badge-router {
+	background: #dcfce7;
+	color: #166534;
+}
+
+.ismart-badge-unknown {
+	background: #f3f4f6;
+	color: #4b5563;
+}
+
+.ismart-btn-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+	margin: 12px 0 4px 0;
+}
+
+.ismart-btn-cell {
+	flex: 1 1 260px;
+	min-width: 240px;
+}
+
+.ismart-big-btn {
+	width: 100%;
+	padding: 14px 12px;
+	font-size: 15px;
+	font-weight: 600;
+}
+
+.ismart-big-btn[disabled] {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.ismart-addr {
+	margin: 10px 0;
+	font-size: 18px;
+}
+
+.ismart-addr-link {
+	font-family: monospace;
+	font-weight: 700;
+	text-decoration: underline;
+	word-break: break-all;
+}

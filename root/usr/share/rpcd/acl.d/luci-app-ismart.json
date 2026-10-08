@@ -1,0 +1,21 @@
+{
+	"luci-app-ismart": {
+		"description": "Grant access to bypass-router mode switching (services/ismart)",
+		"read": {
+			"uci": [ "ismart" ],
+			"file": {
+				"/usr/bin/ismart-ctl": [ "exec" ],
+				"/usr/libexec/ismart/core.sh": [ "read" ],
+				"/var/run/ismart/*": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "ismart" ],
+			"file": {
+				"/usr/bin/ismart-ctl": [ "exec" ],
+				"/usr/libexec/ismart/*": [ "read" ],
+				"/var/run/ismart/*": [ "write" ]
+			}
+		}
+	}
+}

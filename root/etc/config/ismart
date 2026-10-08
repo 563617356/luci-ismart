@@ -1,0 +1,21 @@
+config ismart 'main'
+	# 操作的网口在 network 中的段名
+	option lan_section 'lan'
+	option wan_section 'wan'
+
+	# 旁路由模式下的本机地址
+	option lan_ipaddr '192.168.1.2'
+	option lan_netmask '255.255.255.0'
+
+	# 主路由的地址：既是网关，也是默认 DNS
+	option gateway '192.168.1.1'
+	option dns_primary ''
+
+	# 旁路由是否做 NAT。默认关——旁路由的流量由主路由 NAT。
+	option masq '0'
+
+	# wan 段处理：disable 停用拨号，keep 保持原样
+	option wan_mode 'disable'
+
+	# 切换后观察多久仍未生效就自动回滚（秒）
+	option guard_timeout '90'

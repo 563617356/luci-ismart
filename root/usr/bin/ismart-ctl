@@ -1,0 +1,123 @@
+#!/bin/sh
+# ismart-ctl —— luci-ismart 命令行入口
+#
+# 供 LuCI 后端与 SSH 直接调用。
+# 输出约定：结构化数据走 stdout，日志走 stderr。
+
+CORE="/usr/libexec/ismart/core.sh"
+[ -r "$CORE" ] || CORE="/usr/libexec/ismart/core.sh"
+. "$CORE"
+
+APPLY_RELOAD="/usr/libexec/ismart/apply-reload.sh"
+
+# 切换会改本机 IP，LuCI 的 HTTP 连接必然断掉。
+# 因此先把响应尽快吐回去，再把服务重载丢到后台，
+# 否则页面会一直转圈直到超时，用户以为是"卡死"。
+ISMART_HTTP_DELAY="${ISMART_HTTP_DELAY:-2}"
+
+deferred_reload() {
+	[ -n "$ISMART_NO_RELOAD" ] && return 0
+	[ -x "$APPLY_RELOAD" ] || return 0
+	( sleep "$ISMART_HTTP_DELAY"; "$APPLY_RELOAD" ) >/dev/null 2>&1 &
+	return 0
+}
+
+# 切换到旁路由
+do_bypass() {
+	__dmode="off"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--dhcp)  __dmode="on" ;;
+			--dhcp-local) __dmode="local" ;;
+			--dhcp-off)   __dmode="off" ;;
+			*) ismart_die "未知参数：$1" ;;
+		esac
+		shift
+	done
+
+	ISMART_NO_RELOAD=1 ismart_apply_bypass "$__dmode" || exit 1
+	deferred_reload
+	ismart_log "网络将在 ${ISMART_HTTP_DELAY}s 后重载，页面会断开属正常现象"
+	printf '{"ok":true,"mode":"bypass","dhcp":"%s","ip":"%s","gw":"%s"}\n' \
+		"$__dmode" "$(ismart_cfg lan_ipaddr '')" "$(ismart_cfg gateway '')"
+}
+
+# 切回路由模式
+do_router() {
+	ismart_has_backup || ismart_die "没有备份，无法切回路由模式。请先在路由模式下备份一次。"
+	ISMART_NO_RELOAD=1 ismart_apply_router || exit 1
+	deferred_reload
+	ismart_log "网络将在 ${ISMART_HTTP_DELAY}s 后重载，页面会断开属正常现象"
+	printf '{"ok":true,"mode":"router"}\n'
+}
+
+do_toggle() {
+	case "$(ismart_detect_mode)" in
+		bypass) do_router "$@" ;;
+		*)      do_bypass "$@" ;;
+	esac
+}
+
+do_status() {
+	ismart_status_json
+}
+
+do_backup() {
+	ismart_backup
+	printf '{"ok":true,"time":"%s"}\n' "$(ismart_backup_time)"
+}
+
+do_restore() {
+	do_router
+}
+
+# 强制重载（改了参数点「应用」）
+do_apply() {
+	ismart_reload
+	ismart_status_json
+}
+
+# 供守护进程调用；也允许手工查询
+do_guard() {
+	ismart_guard_check
+}
+
+do_probe() {
+	printf '%s\n' "$(ismart_probe_ip)"
+}
+
+usage() {
+	cat <<'EOF'
+用法: ismart-ctl <命令> [选项]
+
+命令:
+  status                  输出当前状态 JSON
+  to-bypass [选项]        切换到旁路由模式
+  to-router               切回路由模式（从备份整体恢复）
+  toggle [选项]           在两种模式之间切换
+  backup                  立即备份 network/dhcp/firewall
+  restore                 切回路由模式（to-router 的别名）
+  apply                   按当前配置重载服务
+  probe                   打印当前实际生效的 lan IPv4
+  guard                   手动执行一次防回滚检查
+
+to-bypass 选项:
+  --dhcp-off              不接管 DHCP（默认）——主路由发地址，网关指向本机
+  --dhcp                  接管 DHCP，DNS 指向主路由
+  --dhcp-local接管 DHCP，DNS 指向本机（透明代理 / DNS 劫持）
+EOF
+}
+
+case "${1:-}" in
+	status)    shift; do_status "$@" ;;
+	to-bypass) shift; do_bypass "$@" ;;
+	to-router) shift; do_router "$@" ;;
+	toggle)    shift; do_toggle "$@" ;;
+	backup)    shift; do_backup "$@" ;;
+	restore)   shift; do_restore "$@" ;;
+	apply)     shift; do_apply "$@" ;;
+	probe)     shift; do_probe "$@" ;;
+	guard)     shift; do_guard "$@" ;;
+	-h|--help|help|"") usage ;;
+	*)         ismart_die "未知命令：$1（用 --help 查看用法）" ;;
+esac

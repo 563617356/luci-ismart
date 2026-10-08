@@ -1,0 +1,436 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '创建 Release 并上传 ipk/apk'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: shell 语法检查
+        run: |
+          set -eu
+          for f in root/usr/libexec/ismart/core.sh \
+                   root/usr/libexec/ismart/apply-reload.sh \
+                   root/usr/libexec/ismart/guard-loop.sh \
+                   root/usr/bin/ismart-ctl \
+                   root/etc/init.d/ismart; do
+            sh -n "$f" && echo "ok  $f"
+          done
+
+      - name: 核心逻辑测试（mock uci）
+        # Windows 本机跑这套约 10 分钟（每次 uci 调用都要起一个 Python
+        # 解释器做转发），Linux 上快两个数量级，这里只是兜一个超时上限。
+        run: timeout 900 python3 tests/test_ismart.py
+
+      - name: JSON 与 JS 静态检查
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json
+          for p in ('root/usr/share/luci/menu.d/luci-app-ismart.json',
+                    'root/usr/share/rpcd/acl.d/luci-app-ismart.json'):
+              with open(p, encoding='utf-8') as f:
+                  json.load(f)
+              print('ok ', p)
+          PY
+          node --check htdocs/luci-static/resources/view/ismart/ismart.js \
+            && echo 'ok  ismart.js'
+
+  build:
+    name: ${{ matrix.version }} ${{ matrix.arch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SDK 文件名由下载步骤从目录索引动态发现（文件名含 gcc 版本号，
+          # 且 24.10+ 用 .tar.zst、23.05- 用 .tar.xz，硬编码必然失效）。
+          #
+          # arch 必须用各版本真实存在的名字。已逐一核对目录确认：
+          #   x86-64              所有版本
+          #   armsr-armv8         23.05 起（22.03 无此 subtarget）
+          #   armvirt-64          仅 22.03（23.05 起改名）
+          #   qualcommax-ipq807x  24.10/25.12（23.05 无 qualcommax 目录）
+          #
+          # 本项目两个包都是 PKGARCH:=all，架构无关，
+          # 因此这里只验证 SDK 能否正常解包与识别包，不必铺满全架构。
+          - version: '25.12.5'
+            arch: x86-64
+            sdk_subtarget: x86/64
+          - version: '24.10.8'
+            arch: x86-64
+            sdk_subtarget: x86/64
+          - version: '23.05.6'
+            arch: x86-64
+            sdk_subtarget: x86/64
+          - version: '22.03.7'
+            arch: x86-64
+            sdk_subtarget: x86/64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 缓存 SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt
+          # 只按 SDK 坐标做 key——不混入源码 hash，否则改一行代码就重下 1GB。
+          # v2：旧缓存里 feeds/ 处于 detached HEAD，会让 feeds update 必然失败，
+          #     改 key 后缀强制重建。
+          key: sdk-v2-${{ matrix.version }}-${{ matrix.arch }}
+
+      - name: 恢复缓存后清理 feeds
+        if: steps.sdk-cache.outputs.cache-hit == 'true'
+        run: |
+          set -eu
+          cd openwrt
+          # SDK 目录里的 feeds/base 是 SDK 自带的 git 仓库，缓存恢复后处于
+          # detached HEAD（"You are not currently on a branch"），
+          # ./scripts/feeds update 对它执行 git pull 会直接失败：
+          #   Updating feed 'base' from '...;v24.10.8' ...
+          #   You are not currently on a branch. ... failed.
+          # 这与网络无关，是缓存的副作用——只有命中缓存的版本会失败。
+          #
+          # 处理：删掉 feeds/ 与索引缓存，feeds update 会重新 clone。
+          # 只影响 update 的网络开销，不影响 SDK 本体。
+          rm -rf feeds tmp/.packageinfo tmp/.config-package.in 2>/dev/null || true
+          echo "feeds 已清理，feeds update 将重新拉取"
+
+      - name: 下载并解压 SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        env:
+          SDK_VERSION: ${{ matrix.version }}
+          SDK_SUBTARGET: ${{ matrix.sdk_subtarget }}
+          SDK_ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+
+          BASE="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${SDK_SUBTARGET}"
+
+          # SDK 文件名随版本变化很大：
+          #   24.10+ : openwrt-sdk-<ver>-<arch>_gcc-<ver>_musl.Linux-x86_64.tar.zst
+          #   23.05- : openwrt-sdk-<ver>-<arch>_gcc-<ver>_musl.Linux-x86_64.tar.xz
+          # 硬编码必然随 OpenWrt 升级而失效，因此从目录索引中动态发现。
+          NAME="$(curl -fsSL --retry 3 "$BASE/" \
+            | grep -o "openwrt-sdk-[^\"]*\.tar\.\(zst\|xz\)" \
+            | grep -- "-${SDK_ARCH}_" \
+            | head -n1 || true)"
+
+          if [ -z "$NAME" ]; then
+            echo "::error::在 $BASE/ 下未找到 ${SDK_ARCH} 的 SDK 包"
+            echo "可访问 $BASE/ 查看实际文件名"
+            exit 1
+          fi
+
+          URL="$BASE/$NAME"
+          echo "SDK: $NAME"
+          curl -fsSL --retry 3 -o sdk.tar "$URL"
+
+          mkdir -p openwrt
+          case "$NAME" in
+            *.tar.zst) tar --zstd -xf sdk.tar -C openwrt --strip-components=1 ;;
+            *.tar.xz)  tar -xJf  sdk.tar -C openwrt --strip-components=1 ;;
+            *) echo "::error::未知压缩格式: $NAME"; exit 1 ;;
+          esac
+          rm -f sdk.tar
+
+          test -f openwrt/Makefile || { echo "::error::SDK 解压异常"; exit 1; }
+          echo "SDK 就绪"
+
+      - name: 更新 feeds
+        run: |
+          set -eu
+          cd openwrt
+          # 仍保留重试：feeds update -a 要 clone 多个远端仓库，
+          # CI 网络下偶发中断（RPC failed / HTTP 503）确有可能。
+          # 但 24.10.8 长期失败的真正原因不是网络，而是缓存的 SDK 里
+          # feeds/base 处于 detached HEAD（见上一步骤的清理），已单独处理。
+          for attempt in 1 2 3; do
+            echo "=== feeds update -a（第 $attempt 次）==="
+            if ./scripts/feeds update -a; then
+              echo "feeds 更新成功"
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              echo "::error::feeds update 连续 3 次失败"
+              for d in feeds/*/; do
+                [ -d "$d/.git" ] || continue
+                printf '%-24s ' "$d"
+                git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?"
+              done
+              exit 1
+            fi
+            echo "第 $attempt 次失败，20 秒后重试…"
+            sleep 20
+          done
+
+      - name: 接入本仓库为内置包
+        run: |
+          set -eu
+          cd openwrt
+
+          # 放 package/（SDK 内置包路径），由 make 自动扫描。
+          # 不用 feeds 机制的原因见 README：
+          #   - 本地目录不能作 feed 源（src-git 要求 git 源）
+          #   - src-link 虽可用，但 feeds 的包收集只收录走 package.mk 的包，
+          #     界面包会被跳过并报 "No feed for package ... found"
+          # 两个包都走标准 package.mk，make 扫描无歧义。
+          rm -rf package/luci-app-ismart package/ismart-core
+
+          # ---- 界面包 ----
+          # package.mk 的 install 段按 ./htdocs ./root 相对路径取文件，
+          # 因此这些目录必须与 Makefile 同级。
+          mkdir -p package/luci-app-ismart
+          cp "$GITHUB_WORKSPACE/luci/Makefile" package/luci-app-ismart/
+          cp -r "$GITHUB_WORKSPACE/htdocs"            package/luci-app-ismart/
+          cp -r "$GITHUB_WORKSPACE/root"              package/luci-app-ismart/
+
+          # ---- 运行时主包 ----
+          mkdir -p package/ismart-core
+          cp "$GITHUB_WORKSPACE/Makefile" package/ismart-core/
+          cp -r "$GITHUB_WORKSPACE/root"  package/ismart-core/
+
+          echo "=== 界面包 ==="
+          ls package/luci-app-ismart/
+          echo "=== 主包 ==="
+          ls package/ismart-core/
+
+          # 逐项校验：Makefile 的 install 段引用了这些路径，缺一个就装不全。
+          # 这类错误极难发现——编译成功、安装成功、功能全无。
+          for f in \
+            package/luci-app-ismart/Makefile \
+            package/luci-app-ismart/htdocs/luci-static/resources/view/ismart/ismart.js \
+            package/luci-app-ismart/htdocs/luci-static/resources/view/ismart/ismart.css \
+            package/luci-app-ismart/root/usr/share/rpcd/acl.d/luci-app-ismart.json \
+            package/luci-app-ismart/root/usr/share/luci/menu.d/luci-app-ismart.json \
+            package/luci-app-ismart/root/etc/config/ismart \
+            package/ismart-core/Makefile \
+            package/ismart-core/root/usr/libexec/ismart/core.sh \
+            package/ismart-core/root/usr/libexec/ismart/apply-reload.sh \
+            package/ismart-core/root/usr/libexec/ismart/guard-loop.sh \
+            package/ismart-core/root/usr/bin/ismart-ctl \
+            package/ismart-core/root/etc/init.d/ismart \
+            package/ismart-core/root/etc/config/ismart
+          do
+            [ -f "$f" ] || { echo "::error::缺少 $f"; exit 1; }
+          done
+          echo "包文件校验通过（12 项）"
+
+          # 换行符校验：Windows 上传时若被转成 CRLF，
+          # /etc/init.d 与 /usr/bin 下的脚本会直接 "bad interpreter" 失效。
+          if grep -rlU $'\r' package/luci-app-ismart package/ismart-core \
+               --include='*.sh' --include='ismart-ctl' --include='ismart' 2>/dev/null; then
+            echo "::error::检测到 CRLF 换行，请检查 .gitattributes"
+            exit 1
+          fi
+          echo "换行符校验通过（无 CRLF）"
+
+      - name: 安装 LuCI 基础依赖
+        run: |
+          set -eu
+          cd openwrt
+          # luci-base 是界面包 DEPENDS 声明的依赖，必须先 install。
+          # 注意：不要用 -y —— 24.10 的 feeds 脚本不认这个选项，
+          # 会报 "Unknown option: y" 并中止，导致后续包全部装不上。
+          ./scripts/feeds install luci-base
+          test -d package/feeds/luci/luci-base \
+            || { echo "::error::luci-base 安装失败"; exit 1; }
+          echo "luci-base 就绪"
+
+      - name: 准备构建配置
+        run: |
+          set -eu
+          cd openwrt
+          # make download 依赖 .config 展开包列表；没有 .config 时
+          # 新版 SDK 会遍历全部包而失败。写入最小配置并 defconfig。
+          printf '%s\n' \
+            'CONFIG_ALL_NONSHARED=n' \
+            'CONFIG_ALL_KMODS=n' \
+            'CONFIG_ALL=n' \
+            'CONFIG_SIGNED_PACKAGES=n' \
+            'CONFIG_DEVEL=n' \
+            'CONFIG_AUTOREMOVE=n' \
+            'CONFIG_BUILD_TESTING=n' \
+            'CONFIG_PACKAGE_luci-app-ismart=y' \
+            'CONFIG_PACKAGE_ismart-core=y' > .config
+          make defconfig >/dev/null
+          echo "配置条目: $(grep -c '^CONFIG_' .config || true)"
+
+      - name: 校验包已被 make 识别
+        run: |
+          set -eu
+          cd openwrt
+          # 关键校验：确认 make 真的把本包纳入了包列表。
+          # 文件存在性校验证明不了 make 认这个包——
+          # 有过几轮 CI 文件检查全绿、make 却不扫这个目录的情况。
+          #
+          # 注意：未被选中时 .config 里是注释行
+          #   # CONFIG_PACKAGE_xxx is not set
+          # 因此不能只 grep '^CONFIG_PACKAGE_x='，否则会把
+          # "已识别但未选中"误判成"未识别"。
+          for p in luci-app-ismart ismart-core; do
+            if grep -q "^CONFIG_PACKAGE_${p}=" .config; then
+              echo "已启用: $(grep "^CONFIG_PACKAGE_${p}=" .config)"
+            elif grep -q "^# CONFIG_PACKAGE_${p} is not set" .config; then
+              echo "已识别但未选中: ${p}"
+            else
+              echo "::error::make 完全未识别 $p"
+              echo "--- .config 中 ismart 条目 ---"
+              grep -i ismart .config || echo "  (完全没有)"
+              echo "--- package/ 下的本包 ---"
+              ls -la package/luci-app-ismart package/ismart-core 2>/dev/null || true
+              exit 1
+            fi
+          done
+
+      - name: 下载依赖源码
+        run: |
+          set -eu
+          cd openwrt
+          # 只下载编译本包真正需要的依赖，避免全量拉取。
+          # 先尝试整包 download（快路径），失败则退回逐包。
+          if ! make package/luci-app-ismart/download \
+                     package/ismart-core/download -j"$(nproc)"; then
+            echo "::warning::整包 download 失败，改用全量 download"
+            make download -j"$(nproc)" || {
+              echo "::error::download 失败，日志尾部："
+              ls -la dl/ 2>/dev/null | head -n 20 || true
+              exit 1
+            }
+          fi
+          echo "dl/ 中文件数: $(ls dl/ 2>/dev/null | wc -l)"
+
+      - name: 编译
+        run: |
+          set -eu
+          cd openwrt
+          make package/luci-app-ismart/compile V=s -j"$(nproc)"
+          make package/ismart-core/compile    V=s -j"$(nproc)"
+
+      - name: 收集产物
+        if: always()
+        run: |
+          set -u
+          OUT="$GITHUB_WORKSPACE/artifacts"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+
+          # 两个包的产物都要收。ipk 形如 ismart-core_1.0.0-1_all.ipk，
+          # apk 形如 ismart-core-1.0.0-r1.apk（无下划线分版本），
+          # 所以两个模式都要匹配，否则 apk 会被漏掉。
+          #
+          # 关键：加版本与架构后缀。Release 用 merge-multiple 把各架构
+          # artifact 合并到同一目录，同名文件会互相覆盖。
+          VER="${{ matrix.version }}"
+          ARCH_NAME=$(echo "${{ matrix.arch }}" | tr '/' '-')
+          for f in $(find openwrt/bin -type f \
+              \( -name 'luci-app-ismart*.ipk' -o -name 'luci-app-ismart*.apk' \
+              -o -name 'ismart-core*.ipk'    -o -name 'ismart-core*.apk' \) 2>/dev/null); do
+            base=$(basename "$f")
+            ext="${base##*.}"
+            stem="${base%.*}"
+            cp "$f" "$OUT/${stem}_${VER}_${ARCH_NAME}.${ext}"
+            echo "  $(basename "$f") -> ${stem}_${VER}_${ARCH_NAME}.${ext}"
+          done
+
+          echo
+          echo "=== 产物 ==="
+          ls -la "$OUT" || echo "  无产物"
+          n=$(ls -1 "$OUT" 2>/dev/null | wc -l)
+          echo "共 $n 个"
+          [ "$n" -ge 2 ] || echo "::warning::产物少于 2 个，可能有包未编译"
+
+      - name: 诊断
+        if: always()
+        run: |
+          set -u
+          cd openwrt 2>/dev/null || exit 0
+          echo "=== OpenWrt 版本 ==="
+          grep -E '^(VERSION_|SUBTARGET|TARGET_ARCHPACKAGE)' include/version.mk 2>/dev/null || true
+          echo
+          echo "=== feeds 状态 ==="
+          for d in feeds/*/; do
+            [ -d "$d/.git" ] && echo "  ok   $d" || echo "  MISS $d"
+          done
+          echo
+          echo "=== .config 中的 ismart 条目 ==="
+          grep -i ismart .config 2>/dev/null || echo "  (无)"
+          echo
+          echo "=== dl/ 文件数 ==="
+          ls dl/ 2>/dev/null | wc -l
+          echo
+          echo "=== bin/ 产物 ==="
+          find bin -type f \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null | head -n 10 || echo "  无"
+          echo
+          echo "=== 磁盘 ==="
+          df -h . | tail -n1
+
+      - name: 上传 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-ismart-${{ matrix.version }}-${{ matrix.arch }}
+          path: artifacts/*
+          # 编译失败时不额外报错，诊断步骤的输出才是关键信息
+          if-no-files-found: ignore
+
+  release:
+    name: Release
+    needs: build
+    # 用 always()：单个版本构建失败不应阻断整个发布。
+    # 完全失败时 artifacts 为空，download-artifact 与 gh-release 都会跳过，
+    # 不会产生空 Release。
+    if: always() && (startsWith(github.ref, 'refs/tags/v') || inputs.release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 列出产物
+        run: ls -la artifacts/
+
+      - name: 无产物则中止发布
+        run: |
+          set -eu
+          N=$(ls -1 artifacts/ 2>/dev/null | wc -l)
+          echo "合并后产物数: $N"
+          ls -la artifacts/
+          if [ "$N" -eq 0 ]; then
+            echo "::error::没有任何产物，跳过发布"
+            exit 1
+          fi
+          # 4 个版本 × 2 个包 = 8 个文件。全失败时会远少于这个数，
+          # 给出警告但不阻断（部分版本可用仍有价值）。
+          if [ "$N" -lt 4 ]; then
+            echo "::warning::产物仅 $N 个，预期约 8 个（4 版本 × 2 包）"
+            echo "::warning::可能有版本构建失败或文件名冲突导致覆盖"
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

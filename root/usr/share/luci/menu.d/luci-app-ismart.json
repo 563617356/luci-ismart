@@ -1,0 +1,13 @@
+{
+	"admin/services/ismart": {
+		"title": "旁路由模式",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "ismart/ismart"
+		},
+		"depends": {
+			"acl": [ "luci-app-ismart" ]
+		}
+	}
+}
