@@ -19,6 +19,7 @@
 'require dom';
 'require ui';
 'require poll';
+'require rpc';
 
 /*
  * 样式内联注入，不用 'require css/...'。
@@ -91,9 +92,57 @@ function parseJson(s) {
 }
 
 return view.extend({
-	handleSaveApply: null,
-	handleSave: null,
-	handleReset: null,
+	/*
+	 * 必须提供 handleSaveApply，否则 LuCI 认为本页不支持保存，
+	 * **连保存按钮都不会渲染**——真机上就是「保存按钮数 = 0」，
+	 * 参数只能改、存不进去。
+	 *
+	 * 这里只提交 ismart 这一份配置并 apply，不碰 network/dhcp/firewall。
+	 * 真正的网络切换由「一键切换」按钮走 ismart-ctl 完成，
+	 * 与本页保存是两条独立的路径。
+	 */
+	handleSaveApply: function () {
+		this.collectParams();
+
+		return uci.save().then(function () {
+			return rpc.call('uci', 'apply', {
+				rollback: true,
+				timeout: 10
+			});
+		}).then(function () {
+			/*
+			 * ui.addNotification 的第一个参数是通知 id，**不能传 null**。
+			 * LuCI 内部会对它调 charAt，传 null 就抛
+			 * "opt.charAt is not a function" —— 而且这个异常发生在
+			 * Promise 链里，表现为「点了保存但配置没写进去」，
+			 * 控制台只有一条看不出所以然的报错。
+			 * 用一个固定字符串当 id 即可。
+			 */
+			ui.addNotification('ismart-saved', E('p', [
+				_('参数已保存。'),
+				' ',
+				E('a', {
+					'href': L.href('admin/services/ismart'),
+					'class': 'cbi-link',
+					'onclick': function () { location.reload(); }
+				}, _('返回本页查看当前生效状态'))
+			]), E('p', { 'class': 'cbi-value-description' }, [
+				_('注意：改参数不会自动切换模式，仍需点下面的切换按钮。')
+			]));
+		});
+	},
+
+	handleSave: function () {
+		this.collectParams();
+
+		return uci.save();
+	},
+
+	handleReset: function () {
+		return uci.load('ismart').then(function () {
+			location.reload();
+		});
+	},
 
 	load: function () {
 		injectStyle();
@@ -116,16 +165,25 @@ return view.extend({
 	renderRedirect: function (target) {
 		var url = target ? ('http://' + target + '/cgi-bin/luci/admin/services/ismart') : null;
 
+		var linkAttrs = {
+			'href': url || '#',
+			'class': 'ismart-addr-link'
+		};
+
+		/*
+		 * external 不能用 `url ? true : null`。
+		 * LuCI DOM 构造器对属性值调 charAt，传 null 就抛
+		 * "opt.charAt is not a function"。不设时干脆别设这个属性。
+		 */
+		if (url)
+			linkAttrs['external'] = 'true';
+
 		return E('div', { 'class': 'cbi-map-descr' }, [
 			E('h2', {}, [ _('切换已提交') ]),
 			E('p', {}, [ _('路由器正在切换网络模式，LuCI 页面会断开属正常现象。') ]),
 			E('p', {}, [ _('大约 10 秒后用新的管理地址访问：') ]),
 			E('p', { 'class': 'ismart-addr' }, [
-				E('a', {
-					'href': url || '#',
-					'external': url ? true : null,
-					'class': 'ismart-addr-link'
-				}, target || _('未知') )
+				E('a', linkAttrs, target || _('未知') )
 			]),
 			E('p', { 'class': 'cbi-map-descr' }, [
 				E('em', {}, [ _('如果新地址打不开，说明配置未生效，系统会在约 90 秒后自动切回原模式。') ])
@@ -318,14 +376,15 @@ return view.extend({
 	/*
 	 * 参数行：一个说明文字 + 一个绑定到 ismart.main 的输入框。
 	 *
-	 * 用 uci 的标准 form.Map，因为 handleSaveApply 被设成了 null，
-	 * 保存走 LuCI 的「保存并应用」（会写 uci 并 apply）。
-	 * value 从当前 uci 状态取，缺失时回落到 def。
+	 * **不在 change 事件里写 uci 内存态**，而是在 handleSave 时
+	 * 由 collectParams() 从 DOM 统一采集。原因：依赖 change 事件
+	 * 不可靠——真机上就是「输入框里改了值、点了保存、uci 没变」。
+	 * 用户也完全可能用粘贴、退格、方向键改值而不触发 change。
+	 *
+	 * name 属性就是 uci 的 option 名，采集时按它回填。
 	 */
 	renderValue: function (label, description, name, def) {
-		var self = this;
-
-		return E('div', { 'class': 'cbi-value' }, [
+		return E('div', { 'class': 'cbi-value ismart-field' }, [
 			E('label', { 'class': 'cbi-value-title' }, [ label ]),
 			E('div', { 'class': 'cbi-value-field' }, [
 				E('input', {
@@ -333,43 +392,70 @@ return view.extend({
 					'class': 'cbi-input-text',
 					'name': name,
 					'value': (uci.get('ismart', 'main') || {})[name] || def || '',
-					'placeholder': def || '',
-					'change': function () {
-						var map = uci.get('ismart', 'main') || {};
-
-						map[name] = this.value;
-						uci.set('ismart', 'main', map);
-					}
+					'placeholder': def || ''
 				}),
 				E('div', { 'class': 'cbi-value-description' }, [ description || '' ])
 			])
 		]);
 	},
 
+	/*
+	 * 从 DOM 采集所有具名控件的值，写进 uci 内存态。
+	 *
+	 * 选择器限定为 .ismart-field [name]，不用宽泛的 [name]——
+	 * 页面上还有 LuCI 自己注入的带 name 元素，混进来会出问题。
+	 * 每个控件单独 try/catch，一个坏元素不至于让整个保存失败。
+	 */
+	collectParams: function () {
+		document.querySelectorAll('.ismart-field [name]').forEach(function (el) {
+			try {
+				if (!el.name)
+					return;
+
+				/*
+				 * 必须是四参数形式 set(conf, section, option, value)。
+				 *
+				 * 踩过的坑：曾写成 uci.set('ismart', 'main', map) —— 那是
+				 * 「批量」写法，但这个版本的 uci.set 签名是四参数，
+				 * 第三个参数会被当成 option 名，内部对它调 opt.charAt(0)，
+				 * 于是抛 "opt.charAt is not a function"。
+				 * 而这个异常在 handleSave 的调用栈里，表现为
+				 * 「点了保存、页面没报错、配置一点没变」，极难定位。
+				 */
+				uci.set('ismart', 'main', el.name, el.value);
+			} catch (e) {
+				/* 单个控件写不进去就跳过，不影响其它 */
+			}
+		});
+	},
+
 	/* 同 renderValue，但用下拉框。choices 是 [[值, 文本], ...]。 */
 	renderListValue: function (label, description, name, choices) {
-		var self = this;
 		var cur = (uci.get('ismart', 'main') || {})[name];
 
 		if (cur === undefined && choices.length)
 			cur = choices[0][0];
 
-		return E('div', { 'class': 'cbi-value' }, [
+		return E('div', { 'class': 'cbi-value ismart-field' }, [
 			E('label', { 'class': 'cbi-value-title' }, [ label ]),
 			E('div', { 'class': 'cbi-value-field' }, [
 				E('select', {
 					'class': 'cbi-input-select',
-					'change': function () {
-						var map = uci.get('ismart', 'main') || {};
-
-						map[name] = this.value;
-						uci.set('ismart', 'main', map);
-					}
+					'name': name
 				}, choices.map(function (c) {
-					return E('option', {
-						'value': c[0],
-						'selected': (c[0] === cur) ? 'selected' : null
-					}, [ c[1] ]);
+					/*
+					 * selected 属性不能传 null。
+					 * LuCI 的 DOM 构造器会对属性值调 charAt 来决定怎么 set，
+					 * 传 null 进去就抛 "opt.charAt is not a function"，
+					 * 整个 select 渲染失败（真机上每个下拉都报错）。
+					 * 不选中时干脆不设这个属性。
+					 */
+					var attrs = { 'value': c[0] };
+
+					if (c[0] === cur)
+						attrs['selected'] = 'selected';
+
+					return E('option', attrs, [ c[1] ]);
 				})),
 				E('div', { 'class': 'cbi-value-description' }, [ description || '' ])
 			])
@@ -427,13 +513,14 @@ return view.extend({
 		var self = this;
 		return runCtl(['backup']).then(function (res) {
 			var j = parseJson(res.stdout || '');
-			ui.addNotification(null, E('p', [
+			ui.addNotification('ismart-backup-done', E('p', [
 				_('备份完成：'),
 				E('code', {}, [ (j && j.time) || '—' ])
 			]), 'info');
 			return self.fetchStatus();
 		}).then(function (st) {
-			ui.addNotification(null, E('p', [ _('状态已刷新，切换前请确认参数已保存并应用。') ]), 'warning');
+			ui.addNotification('ismart-status-refreshed',
+				E('p', [ _('状态已刷新，切换前请确认参数已保存并应用。') ]), 'warning');
 			return st;
 		});
 	},
