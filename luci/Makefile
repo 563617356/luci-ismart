@@ -25,7 +25,13 @@ define Package/luci-app-ismart
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=旁路由模式切换（界面）
-  DEPENDS:=+luci-base
+  # 依赖 ismart-core 而不是自己装 /etc/config/ismart。
+  #
+  # 真机装出来才发现的问题：两个包都装同一个 conffile 时，
+  # apk 会报 "trying to overwrite etc/config/ismart owned by
+  # ismart-core" 并计入 error 计数（opkg 只是容忍，不是合法）。
+  # 配置文件的所有权应当唯一，归主包。
+  DEPENDS:=+luci-base +ismart-core
   PKGARCH:=all
 endef
 
@@ -35,9 +41,9 @@ define Package/luci-app-ismart/description
   不改写用户的网络结构，并内置超时自动回滚。
 endef
 
-define Package/luci-app-ismart/conffiles
-/etc/config/ismart
-endef
+# 不声明 conffiles，也不在下面安装 /etc/config/ismart。
+# 该文件由 ismart-core 独家拥有（见上面的 DEPENDS 说明），
+# 界面包通过依赖拿到它。
 
 # 全部是预置文件，无源码需要编译
 define Build/Prepare
@@ -54,8 +60,10 @@ define Package/luci-app-ismart/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/ismart
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/ismart/ismart.js \
 		$(1)/www/luci-static/resources/view/ismart/ismart.js
-	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/ismart/ismart.css \
-		$(1)/www/luci-static/resources/view/ismart/ismart.css
+	# 不安装 ismart.css：样式以 CSS_TEXT 常量内联在 ismart.js 里。
+	# 原因见 ismart.js 顶部注释——当前 LuCI 的 'require css/...'
+	# 会去找 .../ismart/ismart/css.js 并 404，导致视图白屏。
+	# 仓库里保留 .css 源文件仅为便于单独维护，由 CI 保证两边一致。
 
 	# ---- rpcd ACL ----
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
@@ -67,9 +75,8 @@ define Package/luci-app-ismart/install
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-ismart.json \
 		$(1)/usr/share/luci/menu.d/luci-app-ismart.json
 
-	# ---- UCI 配置（主包也会装同一份，此处保证单独装界面包时可用）----
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) ./root/etc/config/ismart $(1)/etc/config/ismart
+	# /etc/config/ismart 由 ismart-core 安装，这里不碰：
+	# 同一个文件被两个包声明所有权，apk 会判为 error。
 endef
 
 define Package/luci-app-ismart/postinst

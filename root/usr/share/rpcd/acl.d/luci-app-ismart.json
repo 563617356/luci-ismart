@@ -6,7 +6,7 @@
 			"file": {
 				"/usr/bin/ismart-ctl": [ "exec" ],
 				"/usr/libexec/ismart/core.sh": [ "read" ],
-				"/var/run/ismart/*": [ "read" ]
+				"/etc/ismart/backup/*": [ "read" ]
 			}
 		},
 		"write": {
@@ -14,7 +14,7 @@
 			"file": {
 				"/usr/bin/ismart-ctl": [ "exec" ],
 				"/usr/libexec/ismart/*": [ "read" ],
-				"/var/run/ismart/*": [ "write" ]
+				"/etc/ismart/backup/*": [ "write" ]
 			}
 		}
 	}

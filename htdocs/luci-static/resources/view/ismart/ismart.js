@@ -3,14 +3,72 @@
  * 路径以 /luci-static/ 开头，指向包安装后的 /www/luci-static/。
  */
 'use strict';
-require css/ismart/ismart.css;
 
+/*
+ * 依赖声明一律用带引号的 'require xxx' 形式。
+ *
+ * 不要写成 `require css/ismart/ismart.css;` 这种裸调用——那是把
+ * 依赖当普通 JS 表达式求值，浏览器解析到 `css/ismart/...` 里的
+ * 标识符 css 就抛 "SyntaxError: Unexpected identifier 'css'"，
+ * 整个视图白屏。LuCI 的依赖是靠预处理器扫描这些字符串字面量收集的，
+ * 裸 require 不会被识别，也就没有模块被注入。
+ */
 'require view';
 'require uci';
 'require fs';
 'require dom';
 'require ui';
 'require poll';
+
+/*
+ * 样式内联注入，不用 'require css/...'。
+ *
+ * 这条路在当前 LuCI（openwrt-25.12 / bootstrap 主题）上走不通：
+ * LuCI 会把它当成普通 JS 模块，去找
+ *   /luci-static/resources/css/ismart/ismart/css.js
+ * 而该文件不存在，于是 404 —— 视图同样白屏。
+ * 真机上 grep 全盘 /www/luci-static/resources/ 也确认：
+ * 本机所有能正常工作的 LuCI 应用（vohive、djonehub）都没用 require css，
+ * 那个 resources/css/ 目录压根不存在。
+ *
+ * 所以直接把样式文本插进 <head>。代价是这段 CSS 同时留在 .css 文件里
+ * （便于单独维护），但安装包不再安装它——两处不一致由下面的
+ * CSS_TEXT 常量作为唯一事实来源，CI 有一致性检查盯着。
+ */
+var CSS_TEXT = [
+	'.ismart-table { width: 100%; margin: 0; }',
+	'.ismart-table td { padding: 6px 10px; vertical-align: top;',
+	'  border-bottom: 1px solid rgba(128,128,128,0.18); }',
+	'.ismart-td-key { width: 190px; font-weight: 600; color: #6b7280; }',
+	'.ismart-td-val { word-break: break-all; }',
+	'.ismart-badge-row { margin: 4px 0 12px 0; }',
+	'.ismart-badge { display: inline-block; padding: 5px 16px;',
+	'  border-radius: 14px; font-size: 14px; font-weight: 600;',
+	'  line-height: 1.4; letter-spacing: 0.5px; }',
+	'.ismart-badge-bypass { background: #e0f2fe; color: #075985; }',
+	'.ismart-badge-router { background: #dcfce7; color: #166534; }',
+	'.ismart-badge-unknown { background: #f3f4f6; color: #4b5563; }',
+	'.ismart-btn-row { display: flex; flex-wrap: wrap; gap: 16px;',
+	'  margin: 12px 0 4px 0; }',
+	'.ismart-btn-cell { flex: 1 1 260px; min-width: 240px; }',
+	'.ismart-big-btn { width: 100%; padding: 14px 12px; font-size: 15px;',
+	'  font-weight: 600; }',
+	'.ismart-big-btn[disabled] { opacity: 0.5; cursor: not-allowed; }',
+	'.ismart-addr { margin: 10px 0; font-size: 18px; }',
+	'.ismart-addr-link { font-family: monospace; font-weight: 700;',
+	'  text-decoration: underline; word-break: break-all; }'
+].join('\n');
+
+function injectStyle() {
+	var id = 'ismart-view-style';
+
+	if (document.getElementById(id))
+		return;
+
+	var el = E('style', { 'id': id });
+	el.appendChild(document.createTextNode(CSS_TEXT));
+	document.head.appendChild(el);
+}
 
 /* ismart-ctl 的路径。ACL 里已放行 exec。
  *
@@ -38,6 +96,8 @@ return view.extend({
 	handleReset: null,
 
 	load: function () {
+		injectStyle();
+
 		return Promise.all([
 			uci.load('ismart'),
 			this.fetchStatus()
@@ -253,6 +313,67 @@ return view.extend({
 			self.renderRedirect(target === 'bypass' ? uciState.lan_ipaddr : null)
 		);
 		window.scrollTo(0, 0);
+	},
+
+	/*
+	 * 参数行：一个说明文字 + 一个绑定到 ismart.main 的输入框。
+	 *
+	 * 用 uci 的标准 form.Map，因为 handleSaveApply 被设成了 null，
+	 * 保存走 LuCI 的「保存并应用」（会写 uci 并 apply）。
+	 * value 从当前 uci 状态取，缺失时回落到 def。
+	 */
+	renderValue: function (label, description, name, def) {
+		var self = this;
+
+		return E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, [ label ]),
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('input', {
+					'type': 'text',
+					'class': 'cbi-input-text',
+					'name': name,
+					'value': (uci.get('ismart', 'main') || {})[name] || def || '',
+					'placeholder': def || '',
+					'change': function () {
+						var map = uci.get('ismart', 'main') || {};
+
+						map[name] = this.value;
+						uci.set('ismart', 'main', map);
+					}
+				}),
+				E('div', { 'class': 'cbi-value-description' }, [ description || '' ])
+			])
+		]);
+	},
+
+	/* 同 renderValue，但用下拉框。choices 是 [[值, 文本], ...]。 */
+	renderListValue: function (label, description, name, choices) {
+		var self = this;
+		var cur = (uci.get('ismart', 'main') || {})[name];
+
+		if (cur === undefined && choices.length)
+			cur = choices[0][0];
+
+		return E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, [ label ]),
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('select', {
+					'class': 'cbi-input-select',
+					'change': function () {
+						var map = uci.get('ismart', 'main') || {};
+
+						map[name] = this.value;
+						uci.set('ismart', 'main', map);
+					}
+				}, choices.map(function (c) {
+					return E('option', {
+						'value': c[0],
+						'selected': (c[0] === cur) ? 'selected' : null
+					}, [ c[1] ]);
+				})),
+				E('div', { 'class': 'cbi-value-description' }, [ description || '' ])
+			])
+		]);
 	},
 
 	render: function (data) {

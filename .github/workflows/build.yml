@@ -43,6 +43,12 @@ jobs:
         # 解释器做转发），Linux 上快两个数量级，这里只是兜一个超时上限。
         run: timeout 900 python3 tests/test_ismart.py
 
+      - name: 视图 JS 方法存在性检查
+        # 必须在编译之前跑。node --check 只验语法，调用一个不存在的方法
+        # 在语法上完全合法——v1.1.0 就是这么一路绿灯发布，然后在真机上
+        # 整个视图白屏（this.renderValue is not a function）。
+        run: python3 tests/check_view_js.py
+
       - name: JSON 与 JS 静态检查
         run: |
           set -eu
@@ -55,15 +61,63 @@ jobs:
               print('ok ', p)
           PY
 
-          # LuCI 视图顶部的 'require view' / 'require uci' 是 LuCI 预处理器指令，
-          # 不是合法 JS——直接 node --check 必然报 "Unexpected identifier"。
-          # 先把这些指令行剥掉再检查，剩下的才是真正的 JS 语法。
-          # 这样能抓到括号/字符串不配平这类必然导致页面白屏的问题。
-          sed -e "s/^\s*'require [^']*'\s*;\?\s*$//" \
-              -e "s/^require [^;]*;\s*$//" \
+          # --- LuCI 视图 JS ---
+          #
+          # 依赖声明必须是 'require xxx' 字符串字面量（LuCI 预处理器靠扫
+          # 这些字符串收集依赖）。写成裸调用 `require css/a.css;` 在真机上
+          # 会让浏览器解析器报 "SyntaxError: Unexpected identifier 'css'"，
+          # 整个视图白屏——CI 必须能抓到它。
+          #
+          # 这就是下面那条裸 require 规则存在的理由：早先的检查里有一条
+          # sed 把裸 require 整行删掉，等于亲手把这个 bug 藏了起来。
+          if grep -nE "^[[:space:]]*require[[:space:]]" \
+               htdocs/luci-static/resources/view/ismart/ismart.js; then
+            echo "::error::视图 JS 里有裸 require，必须写成 'require xxx'"
+            exit 1
+          fi
+          echo 'ok  无裸 require'
+
+          # 'require xxx' 本身不是合法 JS（只是个字符串），
+          # 所以 node --check 前要剥掉，剩下才是真正的语法。
+          sed -E "s/^[[:space:]]*'require [^']*'[[:space:]]*;?[[:space:]]*$//" \
               htdocs/luci-static/resources/view/ismart/ismart.js > /tmp/ismart-stripped.js
           node --check /tmp/ismart-stripped.js
           echo 'ok  ismart.js（已剥离 LuCI require 指令）'
+
+          # 反向确认：依赖声明确实被写成了字符串字面量，而不是被误删。
+          # 用 grep -q 而不是数条数——`grep -c` 在无匹配时会输出两行
+          # （"0" 和空行），拼进 [ ] 比较会报 "integer expected"，
+          # 反而把一个本该 PASS 的检查搞崩。
+          if grep -qE "^[[:space:]]*'require [^']+'" \
+               htdocs/luci-static/resources/view/ismart/ismart.js; then
+            echo 'ok  依赖声明存在'
+          else
+            echo "::error::找不到任何 require 声明，视图无法加载"
+            exit 1
+          fi
+
+          # 样式在 ismart.js 里以 CSS_TEXT 常量内联（原因见该文件顶部注释：
+          # 当前 LuCI 的 'require css/...' 会 404）。仓库同时保留 ismart.css
+          # 源文件便于单独维护——两份必须一致，改一边忘了另一边是迟早的事。
+          python3 - <<'PY'
+          import re, sys
+          base = 'htdocs/luci-static/resources/view/ismart/'
+          css = open(base + 'ismart.css', encoding='utf-8').read()
+          js = open(base + 'ismart.js', encoding='utf-8').read()
+          pick = lambda t: sorted(set(re.findall(r'\.(ismart-[a-z-]+)', t)))
+          only_css, only_js = pick(css), pick(js)
+          miss = [s for s in only_css if s not in only_js]
+          extra = [s for s in only_js if s not in only_css]
+          if miss or extra:
+              if miss:
+                  print('::error::以下选择器在 ismart.css 有、JS 内联版没有: %s'
+                        % ' '.join(miss))
+              if extra:
+                  print('::error::以下选择器在 JS 内联版有、ismart.css 没有: %s'
+                        % ' '.join(extra))
+              sys.exit(1)
+          print('  ok  样式一致（%d 个选择器）' % len(only_css))
+          PY
 
   build:
     name: ${{ matrix.version }} ${{ matrix.label }}
