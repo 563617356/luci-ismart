@@ -384,7 +384,7 @@ return view.extend({
 	 * name 属性就是 uci 的 option 名，采集时按它回填。
 	 */
 	renderValue: function (label, description, name, def) {
-		return E('div', { 'class': 'cbi-value ismart-field' }, [
+		return E('div', { 'class': 'cbi-value cfg-field' }, [
 			E('label', { 'class': 'cbi-value-title' }, [ label ]),
 			E('div', { 'class': 'cbi-value-field' }, [
 				E('input', {
@@ -402,12 +402,12 @@ return view.extend({
 	/*
 	 * 从 DOM 采集所有具名控件的值，写进 uci 内存态。
 	 *
-	 * 选择器限定为 .ismart-field [name]，不用宽泛的 [name]——
+	 * 选择器限定为 .cfg-field [name]，不用宽泛的 [name]——
 	 * 页面上还有 LuCI 自己注入的带 name 元素，混进来会出问题。
 	 * 每个控件单独 try/catch，一个坏元素不至于让整个保存失败。
 	 */
 	collectParams: function () {
-		document.querySelectorAll('.ismart-field [name]').forEach(function (el) {
+		document.querySelectorAll('.cfg-field [name]').forEach(function (el) {
 			try {
 				if (!el.name)
 					return;
@@ -436,7 +436,7 @@ return view.extend({
 		if (cur === undefined && choices.length)
 			cur = choices[0][0];
 
-		return E('div', { 'class': 'cbi-value ismart-field' }, [
+		return E('div', { 'class': 'cbi-value cfg-field' }, [
 			E('label', { 'class': 'cbi-value-title' }, [ label ]),
 			E('div', { 'class': 'cbi-value-field' }, [
 				E('select', {
